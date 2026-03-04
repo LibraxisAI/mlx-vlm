@@ -11,19 +11,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
 from .models import cache
 from .prompt_utils import apply_chat_template
-from .sample_utils import top_p_sampling
-from .utils import (
-    StoppingCriteria,
-    apply_repetition_penalty,
-    group_images_by_shape,
-    load,
-    prepare_inputs,
-)
+from .utils import StoppingCriteria, group_images_by_shape, load, prepare_inputs
 
 DEFAULT_MODEL_PATH = "mlx-community/nanoLLaVA-1.5-8bit"
 DEFAULT_IMAGE = None
@@ -153,6 +147,13 @@ def parse_arguments():
         help="Trust remote code when loading the model.",
     )
     parser.add_argument(
+        "--quantize-activations",
+        "-qa",
+        action="store_true",
+        help="Enable activation quantization for QQLinear layers. "
+        "Only supported for models quantized with 'nvfp4' or 'mxfp8' modes.",
+    )
+    parser.add_argument(
         "--processor-kwargs",
         type=json.loads,
         default={},
@@ -243,6 +244,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = 2048,
     **kwargs,
@@ -270,7 +272,11 @@ def generate_step(
         kv_bits (int, optional): Number of bits for KV cache quantization.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Start index for quantized KV cache. Default: ``0``.
-        logits_processors (list, optional): List of logits processor functions.
+        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+          token from a vector of log probabilities. Default: ``None``.
+        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+          A list of functions that take tokens and logits and return the processed
+          logits. Default: ``None``.
         prefill_step_size (int): Number of tokens to process per prefill step.
           Chunked prefill processes prompts in smaller chunks to reduce peak
           memory usage. Default: ``2048``.
@@ -287,32 +293,17 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    def sample(logits: mx.array) -> Tuple[mx.array, float]:
-        if logit_bias:
-            indices = mx.array(list(logit_bias.keys()))
-            values = mx.array(list(logit_bias.values()))
-            logits[:, indices] += values
-        logprobs = logits - mx.logsumexp(logits)
+    if sampler is None:
+        sampler = make_sampler(temperature, top_p)
 
-        if temperature == 0:
-            token = mx.argmax(logits, axis=-1)
-        else:
-            if top_p > 0 and top_p < 1.0:
-                token = top_p_sampling(logits, top_p, temperature)
-            else:
-                token = mx.random.categorical(logits * (1 / temperature))
-
-        return token, logprobs
-
-    if repetition_penalty and (
-        repetition_penalty < 0 or not isinstance(repetition_penalty, float)
-    ):
-        raise ValueError(
-            f"repetition_penalty must be a non-negative float, got {repetition_penalty}"
-        )
+    processors = make_logits_processors(
+        logit_bias, repetition_penalty, repetition_context_size
+    )
+    if logits_processors is not None:
+        processors.extend(logits_processors)
 
     y = input_ids
-    tokens = None  # Track tokens for logits processors
+    tokens = mx.array([], dtype=input_ids.dtype)
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -321,13 +312,9 @@ def generate_step(
             max_kv_size=max_kv_size,
         )
 
-    repetition_context = input_ids.reshape(-1).tolist()
-
-    if repetition_context_size:
-        repetition_context = repetition_context[-repetition_context_size:]
-
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, repetition_context, kwargs
+        nonlocal tokens, kwargs
+
         with mx.stream(generation_stream):
             if "decoder_input_ids" in kwargs:
                 outputs = model.language_model(
@@ -344,35 +331,21 @@ def generate_step(
 
             logits = outputs.logits[:, -1, :]
 
-            # Apply logits processors before repetition penalty
-            if logits_processors:
-                # Efficiently update tokens by concatenating only the new token
-                tokens = mx.concat([tokens, y])
-                for processor in logits_processors:
+            if len(processors) > 0 and len(y) > 0:
+                tokens = mx.concat([tokens, y.flatten()])
+
+                for processor in processors:
                     logits = processor(tokens, logits)
 
-            if repetition_penalty:
-                logits = apply_repetition_penalty(
-                    logits, repetition_context, repetition_penalty
-                )
-                y, logprobs = sample(logits)
-                repetition_context.append(y.item())
-            else:
-                y, logprobs = sample(logits)
-
-            if repetition_context_size:
-                if len(repetition_context) > repetition_context_size:
-                    repetition_context = repetition_context[-repetition_context_size:]
-
             quantize_cache_fn(prompt_cache)
+
+            logprobs = logits - mx.logsumexp(logits)
+            y = sampler(logprobs)
 
             if outputs.cross_attention_states is not None:
                 kwargs = {"cross_attention_states": outputs.cross_attention_states}
             elif outputs.encoder_outputs is not None:
-                kwargs = {
-                    "decoder_input_ids": y[None],
-                    "encoder_outputs": outputs.encoder_outputs,
-                }
+                kwargs = {"encoder_outputs": outputs.encoder_outputs}
             else:
                 kwargs = {}
 
@@ -404,6 +377,7 @@ def generate_step(
                         inputs=input_ids[:, :n_to_process],
                         inputs_embeds=inputs_embeds[:, :n_to_process],
                         cache=prompt_cache,
+                        n_to_process=n_to_process,
                         **kwargs,
                     )
                     quantize_cache_fn(prompt_cache)
@@ -822,7 +796,7 @@ class BatchGenerator:
         sampler: Optional[Callable[[mx.array], mx.array]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
-        prefill_step_size: int = 2048,
+        prefill_step_size: Optional[int] = 2048,
         prompt_cache=None,
     ):
         self.model = model
@@ -882,9 +856,14 @@ class BatchGenerator:
                 kwargs[key] = value[:batch_size]
 
         inputs_embeds = kwargs.pop("inputs_embeds", None)
+        if inputs_embeds is None:
+            raise ValueError("inputs_embeds is required")
 
-        if inputs_embeds is not None:
-            # Multimodal prefill
+        if (
+            self.prefill_step_size is not None
+            and inputs_embeds.shape[1] > self.prefill_step_size
+        ):
+            # Chunked prefill with embeddings
             while inputs_embeds.shape[1] > 1:
                 n_to_process = min(self.prefill_step_size, inputs_embeds.shape[1] - 1)
                 self.model(
@@ -899,18 +878,10 @@ class BatchGenerator:
                 inputs = inputs[:, n_to_process:]
                 mx.clear_cache()
 
-            kwargs = {"inputs_embeds": inputs_embeds}
+        y, logprobs = self._step(
+            inputs, prompt_cache, inputs_embeds=inputs_embeds, **kwargs
+        )
 
-        else:
-            # Text-only prefill
-            while inputs.shape[1] > 1 and inputs_embeds is None:
-                n_to_process = min(self.prefill_step_size, inputs.shape[1] - 1)
-                self.model(inputs[:, :n_to_process], cache=prompt_cache)
-                mx.eval([c.state for c in prompt_cache])
-                inputs = inputs[:, n_to_process:]
-                mx.clear_cache()
-
-        y, logprobs = self._step(inputs, prompt_cache, **kwargs)
         mx.async_eval(y, logprobs)
         mx.clear_cache()
         return Batch(
@@ -1235,6 +1206,7 @@ def _generate_batch(
     )
     input_ids = inputs.get("input_ids", None)
     pixel_values = inputs.get("pixel_values", None)
+    mask = inputs.get("attention_mask", None)
 
     data_kwargs = {
         k: v
@@ -1252,31 +1224,12 @@ def _generate_batch(
     )
 
     with wired_limit(model, [generation_stream]):
-        if pixel_values is not None:
-            embedding_output = model.get_input_embeddings(
-                input_ids, pixel_values, **data_kwargs
-            )
 
-            # Normalize embedding output to a kwargs dict expected by BatchGenerator
-            if isinstance(embedding_output, dict):
-                embed_kwargs = embedding_output
-            elif hasattr(embedding_output, "to_dict"):
-                # Convert to dict and keep non-None fields
-                embed_kwargs = {
-                    k: v for k, v in embedding_output.to_dict().items() if v is not None
-                }
-            else:
-                # Assume it's directly an inputs_embeds array
-                embed_kwargs = {"inputs_embeds": embedding_output}
+        embedding_output = model.get_input_embeddings(
+            input_ids, pixel_values, mask=mask, **data_kwargs
+        )
 
-            gen_kwargs = {
-                "pixel_values": pixel_values,
-                **data_kwargs,
-                **embed_kwargs,
-            }
-        else:
-            input_ids = mx.squeeze(input_ids, axis=0)
-            gen_kwargs = {}
+        gen_kwargs = {**data_kwargs, **embedding_output.to_dict()}
 
         uids = gen.insert(input_ids.tolist(), max_tokens)
         results = {uid: [] for uid in uids}
@@ -1299,6 +1252,7 @@ def main():
         args.adapter_path,
         revision=args.revision,
         trust_remote_code=args.trust_remote_code,
+        quantize_activations=args.quantize_activations,
     )
     config = model.config
 

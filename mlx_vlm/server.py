@@ -3,6 +3,7 @@ import asyncio
 import gc
 import json
 import os
+import time
 import traceback
 import uuid
 from datetime import datetime
@@ -11,6 +12,7 @@ from typing import Any, List, Literal, Optional, Tuple, Union
 import mlx.core as mx
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from huggingface_hub import scan_cache_dir
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,6 +35,14 @@ app = FastAPI(
     title="MLX-VLM Inference API",
     description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
     version=__version__,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 MAX_IMAGES = 10  # Maximum number of images to process at once
@@ -448,11 +458,15 @@ class ChatResponse(BaseModel):
 
 
 class ChatStreamChoice(BaseModel):
+    index: int = 0
     finish_reason: Optional[str] = None
     delta: ChatMessage
 
 
 class ChatStreamChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
     model: str
     choices: List[ChatStreamChoice]
     usage: Optional[UsageStats]
@@ -476,6 +490,7 @@ class ModelsResponse(BaseModel):
 
 
 @app.post("/responses")
+@app.post("/v1/responses", include_in_schema=False)
 async def responses_endpoint(request: Request):
     """
     OpenAI-compatible endpoint for generating text based on a prompt and optional images.
@@ -736,7 +751,15 @@ async def responses_endpoint(request: Request):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -812,6 +835,7 @@ async def responses_endpoint(request: Request):
 @app.post(
     "/chat/completions", response_model=None
 )  # Response model handled dynamically based on stream flag
+@app.post("/v1/chat/completions", response_model=None, include_in_schema=False)
 async def chat_completions_endpoint(request: ChatRequest):
     """
     Generate text based on a prompt and optional images.
@@ -892,6 +916,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         **kwargs,
                     )
 
+                    request_id = f"chatcmpl-{uuid.uuid4()}"
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
@@ -914,7 +939,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             )
                         ]
                         chunk_data = ChatStreamChunk(
-                            model=request.model, usage=usage_stats, choices=choices
+                            id=request_id,
+                            created=int(time.time()),
+                            model=request.model,
+                            usage=usage_stats,
+                            choices=choices,
                         )
 
                         yield f"data: {chunk_data.model_dump_json()}\n\n"
@@ -930,9 +959,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                         )
                     ]
                     chunk_data = ChatStreamChunk(
-                        model=request.model, usage=usage_stats, choices=choices
+                        id=request_id,
+                        created=int(time.time()),
+                        model=request.model,
+                        usage=usage_stats,
+                        choices=choices,
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
+
+                    yield f"data: [DONE]\n\n"
 
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
@@ -945,7 +980,15 @@ async def chat_completions_endpoint(request: ChatRequest):
                     gc.collect()
                     print("Stream finished, cleared cache.")
 
-            return StreamingResponse(stream_generator(), media_type="text/event-stream")
+            return StreamingResponse(
+                stream_generator(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
 
         else:
             # Non-streaming response
@@ -1011,6 +1054,7 @@ async def chat_completions_endpoint(request: ChatRequest):
 
 
 @app.get("/models", response_model=ModelsResponse)
+@app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
 def models_endpoint():
     """
     Return list of locally downloaded MLX models.
