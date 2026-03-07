@@ -2,6 +2,7 @@ import inspect
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_map
 
 
@@ -2171,6 +2172,147 @@ class TestModels(unittest.TestCase):
             config.text_config.num_hidden_layers,
         )
 
+    def test_minicpmo(self):
+        from mlx_vlm.models import minicpmo
+
+        text_config = minicpmo.TextConfig(
+            model_type="minicpmo",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            num_key_value_heads=4,
+            head_dim=16,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+        )
+        vision_config = minicpmo.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            image_size=28,
+            patch_size=14,
+        )
+        setattr(vision_config, "spatial_merge_size", 1)
+        config = minicpmo.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            query_num=4,
+        )
+        setattr(config, "image_token_id", 1)
+        setattr(config, "video_token_id", 2)
+        setattr(config, "vision_start_token_id", 3)
+        model = minicpmo.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
+
+        self.vision_test_runner(
+            model.vision_tower,
+            config.vision_config.model_type,
+            config.vision_config.hidden_size,
+            config.vision_config.num_channels,
+            (config.vision_config.image_size, config.vision_config.image_size),
+            vision_feature_layer=0,
+        )
+
+    def test_phi4mm(self):
+        from mlx_vlm.models import phi4mm
+
+        config = phi4mm.ModelConfig(
+            text_config=phi4mm.TextConfig(
+                model_type="phi4mm",
+                max_position_embeddings=2048,
+            ),
+            vision_config=phi4mm.VisionConfig(
+                model_type="siglip2_vision_model",
+                hidden_size=32,
+                intermediate_size=64,
+                num_attention_heads=4,
+                num_hidden_layers=2,
+                patch_size=14,
+                image_size=28,
+                num_channels=3,
+                layer_norm_eps=1e-6,
+            ),
+            model_type="phi4mm",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            mm_hidden_size=32,
+            image_token_index=-200,
+            audio_token_index=200,
+            audio_processor={
+                "config": {
+                    "attention_dim": 32,
+                    "attention_heads": 4,
+                    "num_blocks": 2,
+                    "linear_units": 64,
+                    "input_size": 80,
+                    "time_reduction": 8,
+                    "kernel_size": 3,
+                    "conv_channels": 32,
+                    "ext_pw_out_channel": 32,
+                    "depthwise_seperable_out_channel": 32,
+                }
+            },
+        )
+        model = phi4mm.Model(config)
+
+        # Language model
+        self.assertEqual(model.model_type, config.model_type)
+        self.assertEqual(len(model.layers), config.num_hidden_layers)
+
+        batch_size = 1
+        for t in [mx.float32, mx.float16]:
+            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+
+            inputs = mx.array([[0, 1]])
+            outputs = model(inputs)
+            logits = outputs.logits
+            self.assertEqual(logits.shape, (batch_size, 2, config.vocab_size))
+            self.assertEqual(logits.dtype, t)
+
+        # Vision tower: SigLIP2 with NaFlex
+        # Input: (B, num_patches, patch_dim) where patch_dim = P*P*C
+        patch_size = config.vision_config.patch_size
+        num_channels = config.vision_config.num_channels
+        img_size = config.vision_config.image_size
+        patch_dim = patch_size * patch_size * num_channels
+        num_patches = (img_size // patch_size) ** 2
+        pixel_values = mx.random.uniform(shape=(1, num_patches, patch_dim))
+        features = model.vision_tower(pixel_values)
+        self.assertEqual(features.shape[-1], config.vision_config.hidden_size)
+
+        # MM projector: projects vision features to LLM hidden size
+        projected = model.apply_mm_projector(features)
+        self.assertEqual(projected.shape[-1], config.hidden_size)
+
+        # Audio encoder: Conformer
+        # Input: (B, T, 80) mel spectrogram features
+        audio_input = mx.random.uniform(shape=(1, 100, 80))
+        audio_mask = mx.ones((1, 100))
+        encoded_audio, _ = model.audio_encoder(audio_input, audio_mask)
+        audio_config = getattr(config, "_audio_config")
+        self.assertEqual(encoded_audio.shape[-1], audio_config.attention_dim)
+
+        # Audio projection: projects audio features to LLM hidden size
+        audio_projected = model.audio_projection(encoded_audio, mode="speech")
+        self.assertEqual(audio_projected.shape[-1], config.hidden_size)
+
     def test_glm_ocr(self):
         from mlx_vlm.models import glm_ocr
 
@@ -2259,6 +2401,49 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(hidden_states.shape[0], expected_patches)
         self.assertEqual(hidden_states.shape[1], config.vision_config.out_hidden_size)
+
+    def test_phi4_siglip(self):
+        from mlx_vlm.models import phi4_siglip
+
+        text_config = phi4_siglip.TextConfig(
+            model_type="phi4-siglip",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=1000,
+            rms_norm_eps=1e-5,
+            rope_theta=500000.0,
+            partial_rotary_factor=1.0,
+        )
+
+        vision_config = phi4_siglip.VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_channels=3,
+            patch_size=14,
+            num_patches=256,
+        )
+
+        config = phi4_siglip.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="phi4-siglip",
+            mm_hidden_size=16,
+        )
+
+        model = phi4_siglip.Model(config)
+
+        self.language_test_runner(
+            model.language_model,
+            config.text_config.model_type,
+            config.text_config.vocab_size,
+            config.text_config.num_hidden_layers,
+        )
 
 
 class TestGetInputEmbeddings(unittest.TestCase):
@@ -3220,6 +3405,55 @@ class TestGetInputEmbeddings(unittest.TestCase):
         self.assertIsNotNone(result_bf16.inputs_embeds)
         self.assertEqual(result_bf16.inputs_embeds.dtype, mx.bfloat16)
 
+    def test_phi4mm_input_embeddings(self):
+        from mlx_vlm.models import phi4mm
+
+        model = phi4mm.Model(
+            phi4mm.ModelConfig(
+                text_config=phi4mm.TextConfig(
+                    model_type="phi4mm",
+                    max_position_embeddings=2048,
+                ),
+                vision_config=phi4mm.VisionConfig(
+                    model_type="siglip2_vision_model",
+                    hidden_size=32,
+                    intermediate_size=64,
+                    num_attention_heads=4,
+                    num_hidden_layers=2,
+                    patch_size=14,
+                    image_size=28,
+                    num_channels=3,
+                    layer_norm_eps=1e-6,
+                ),
+                model_type="phi4mm",
+                vocab_size=256,
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                rms_norm_eps=1e-5,
+                mm_hidden_size=32,
+                image_token_index=-200,
+                audio_token_index=200,
+                audio_processor={
+                    "config": {
+                        "attention_dim": 32,
+                        "attention_heads": 4,
+                        "num_blocks": 2,
+                        "linear_units": 64,
+                        "input_size": 80,
+                        "time_reduction": 8,
+                        "kernel_size": 3,
+                        "conv_channels": 32,
+                        "ext_pw_out_channel": 32,
+                        "depthwise_seperable_out_channel": 32,
+                    }
+                },
+            )
+        )
+        self._check_returns_input_embeddings_features(model, "phi4mm")
+
     def test_qwen3_vl_moe_input_embeddings(self):
         from mlx_vlm.models import qwen3_vl_moe
 
@@ -3389,6 +3623,40 @@ class TestGetInputEmbeddings(unittest.TestCase):
             )
         )
         self._check_returns_input_embeddings_features(model, "glm_ocr")
+
+    def test_phi4_siglip_input_embeddings(self):
+        from mlx_vlm.models import phi4_siglip
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        model = phi4_siglip.Model(
+            phi4_siglip.ModelConfig(
+                text_config=phi4_siglip.TextConfig(
+                    model_type="phi4-siglip",
+                    hidden_size=16,
+                    num_hidden_layers=1,
+                    intermediate_size=32,
+                    num_attention_heads=2,
+                    num_key_value_heads=2,
+                    vocab_size=32,
+                    rms_norm_eps=1e-5,
+                ),
+                vision_config=phi4_siglip.VisionConfig(
+                    model_type="siglip2_vision_model",
+                    hidden_size=16,
+                    intermediate_size=32,
+                    num_hidden_layers=1,
+                    num_attention_heads=2,
+                    patch_size=14,
+                    num_patches=256,
+                ),
+                model_type="phi4-siglip",
+                mm_hidden_size=16,
+            )
+        )
+        input_ids = mx.array([[1, 2, 3, 4, 5]])
+        result = model.get_input_embeddings(input_ids)
+        self.assertIsInstance(result, InputEmbeddingsFeatures)
+        self.assertIsNotNone(result.inputs_embeds)
 
 
 class TestChunkedPrefillRoPE(unittest.TestCase):
@@ -3598,6 +3866,290 @@ class TestChunkedPrefillRoPE(unittest.TestCase):
             outputs.logits.shape,
             (1, chunked_input_ids.shape[1], text_config.vocab_size),
         )
+
+
+class TestMiniCPMO(unittest.TestCase):
+
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models import minicpmo
+
+        text_config = minicpmo.TextConfig(
+            model_type="minicpmo",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            rms_norm_eps=1e-6,
+            vocab_size=256,
+            num_key_value_heads=4,
+            head_dim=16,
+            rope_theta=10000.0,
+            max_position_embeddings=2048,
+        )
+        vision_config = minicpmo.VisionConfig(
+            model_type="siglip_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_channels=3,
+            image_size=28,
+            patch_size=14,
+        )
+        return minicpmo.ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            query_num=4,
+        )
+
+    def test_minicpmo_config_from_root_fields(self):
+        from mlx_vlm.models import minicpmo
+
+        cfg = {
+            "model_type": "minicpmo",
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 151936,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 40960,
+            "query_num": 64,
+            "vision_config": {
+                "model_type": "siglip",
+                "hidden_size": 1152,
+                "intermediate_size": 4304,
+                "num_hidden_layers": 27,
+                "num_attention_heads": 16,
+                "num_channels": 3,
+                "image_size": 448,
+                "patch_size": 14,
+            },
+        }
+        model_config = minicpmo.ModelConfig.from_dict(cfg)
+        self.assertEqual(model_config.text_config.hidden_size, 4096)
+        self.assertEqual(model_config.vision_config.model_type, "siglip_vision_model")
+        self.assertEqual(model_config.query_num, 64)
+
+    def test_minicpmo_sanitize_key_mapping_and_qkv_split(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        weights = {
+            "llm.model.embed_tokens.weight": mx.zeros((10, 10)),
+            "llm.lm_head.weight": mx.zeros((10, 10)),
+            "vpm.embeddings.patch_embedding.weight": mx.zeros((8, 3, 14, 14)),
+            "resampler.attn.in_proj_weight": mx.zeros((192, 64)),
+            "resampler.attn.in_proj_bias": mx.zeros((192,)),
+            "apm.conv1.weight": mx.zeros((1, 1)),
+        }
+
+        sanitized = model.sanitize(weights)
+        self.assertIn("language_model.model.embed_tokens.weight", sanitized)
+        self.assertIn("language_model.lm_head.weight", sanitized)
+        self.assertIn("vision_tower.embeddings.patch_embedding.weight", sanitized)
+        self.assertNotIn("apm.conv1.weight", sanitized)
+
+        self.assertIn("resampler.attn.q_proj.weight", sanitized)
+        self.assertIn("resampler.attn.k_proj.weight", sanitized)
+        self.assertIn("resampler.attn.v_proj.weight", sanitized)
+        self.assertIn("resampler.attn.q_proj.bias", sanitized)
+        self.assertIn("resampler.attn.k_proj.bias", sanitized)
+        self.assertIn("resampler.attn.v_proj.bias", sanitized)
+
+    def test_minicpmo_sanitize_audio_conv_layout(self):
+        from mlx_vlm.models import minicpmo
+
+        model = minicpmo.Model(self._tiny_config())
+        weights = {
+            "apm.conv1.weight": mx.zeros((8, 80, 3)),
+            "apm.conv2.weight": mx.zeros((8, 8, 3)),
+        }
+
+        sanitized = model.sanitize(weights)
+        self.assertEqual(sanitized["audio_tower.conv1.weight"].shape, (8, 3, 80))
+        self.assertEqual(sanitized["audio_tower.conv2.weight"].shape, (8, 3, 8))
+
+
+class TestPhi4MM(unittest.TestCase):
+
+    @staticmethod
+    def _tiny_config():
+        from mlx_vlm.models.phi4mm.config import ModelConfig, TextConfig, VisionConfig
+
+        text_config = TextConfig(
+            model_type="phi4mm",
+            max_position_embeddings=2048,
+        )
+        vision_config = VisionConfig(
+            model_type="siglip2_vision_model",
+            hidden_size=32,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=2,
+            patch_size=14,
+            image_size=28,
+            num_channels=3,
+            layer_norm_eps=1e-6,
+        )
+        return ModelConfig(
+            text_config=text_config,
+            vision_config=vision_config,
+            model_type="phi4mm",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            mm_hidden_size=32,
+            image_token_index=-200,
+            audio_token_index=200,
+            vision_lora={"r": 4, "lora_alpha": 8},
+            speech_lora={"r": 4, "lora_alpha": 8},
+            audio_processor={
+                "config": {
+                    "attention_dim": 32,
+                    "attention_heads": 4,
+                    "num_blocks": 2,
+                    "linear_units": 64,
+                    "input_size": 80,
+                    "time_reduction": 8,
+                    "kernel_size": 3,
+                    "conv_channels": 32,
+                    "ext_pw_out_channel": 32,
+                    "depthwise_seperable_out_channel": 32,
+                }
+            },
+        )
+
+    def test_phi4mm_sanitize_lora_keys(self):
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        hidden = config.hidden_size
+        qkv_size = config.num_attention_heads * (
+            hidden // config.num_attention_heads
+        ) + 2 * config.num_key_value_heads * (hidden // config.num_attention_heads)
+        lora_r = 4
+
+        weights = {
+            # Base layer weight
+            "model.layers.0.self_attn.qkv_proj.base_layer.weight": mx.zeros(
+                (qkv_size, hidden)
+            ),
+            # Vision LoRA
+            "model.layers.0.self_attn.qkv_proj.lora_A.vision.weight": mx.zeros(
+                (lora_r, hidden)
+            ),
+            "model.layers.0.self_attn.qkv_proj.lora_B.vision.weight": mx.zeros(
+                (qkv_size, lora_r)
+            ),
+            # Speech LoRA
+            "model.layers.0.self_attn.qkv_proj.lora_A.speech.weight": mx.zeros(
+                (lora_r, hidden)
+            ),
+            "model.layers.0.self_attn.qkv_proj.lora_B.speech.weight": mx.zeros(
+                (qkv_size, lora_r)
+            ),
+            # Embed tokens
+            "model.embed_tokens.weight": mx.zeros((config.vocab_size, hidden)),
+        }
+
+        sanitized = model.sanitize(weights)
+
+        # Base layer should be merged with vision LoRA by default
+        self.assertIn(
+            "language_model.model.layers.0.self_attn.qkv_proj.weight", sanitized
+        )
+        # LoRA keys should not appear in sanitized output
+        for k in sanitized:
+            self.assertNotIn("lora_A", k)
+            self.assertNotIn("lora_B", k)
+            self.assertNotIn("base_layer", k)
+
+        # Speech LoRA should be stored for runtime switching
+        self.assertTrue(len(model._speech_lora_a) > 0)
+        self.assertTrue(len(model._speech_lora_b) > 0)
+        self.assertTrue(len(model._base_weights) > 0)
+
+    def test_phi4mm_quant_predicate_skips_multimodal(self):
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        predicate = model.quant_predicate
+
+        # Language model layers should be quantized
+        self.assertTrue(
+            predicate(
+                "language_model.model.layers.0.self_attn.qkv_proj", nn.Linear(4, 4)
+            )
+        )
+
+        # Multimodal modules should NOT be quantized
+        self.assertFalse(
+            predicate("audio_encoder.encoders.0.attn.linear_q", nn.Linear(4, 4))
+        )
+        self.assertFalse(predicate("audio_projection.speech.proj_0", nn.Linear(4, 4)))
+        self.assertFalse(predicate("mm_projector.0", nn.Linear(4, 4)))
+        self.assertFalse(
+            predicate("vision_tower.vision_tower.encoder.layers.0", nn.Linear(4, 4))
+        )
+
+    def test_phi4mm_quant_predicate_clears_lora(self):
+        """Accessing quant_predicate should merge LoRAs and clear stored copies."""
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+
+        hidden = config.hidden_size
+        head_dim = hidden // config.num_attention_heads
+        qkv_size = (
+            config.num_attention_heads * head_dim
+            + 2 * config.num_key_value_heads * head_dim
+        )
+        key = "language_model.model.layers.0.self_attn.qkv_proj.weight"
+        lora_r = 4
+
+        # Set up LoRA weights with correct shapes
+        model._base_weights = {key: mx.ones((qkv_size, hidden))}
+        model._speech_lora_a = {key: mx.zeros((lora_r, hidden))}
+        model._speech_lora_b = {key: mx.zeros((qkv_size, lora_r))}
+        model._speech_lora_scale = 1.0
+        model._vision_lora_a = {key: mx.zeros((lora_r, hidden))}
+        model._vision_lora_b = {key: mx.zeros((qkv_size, lora_r))}
+        model._vision_lora_scale = 1.0
+        model._active_lora = "vision"
+
+        # Accessing the property triggers merge and clears LoRA dicts
+        _ = model.quant_predicate
+
+        self.assertEqual(len(model._base_weights), 0)
+        self.assertEqual(len(model._speech_lora_a), 0)
+        self.assertEqual(len(model._speech_lora_b), 0)
+        self.assertEqual(len(model._vision_lora_a), 0)
+        self.assertEqual(len(model._vision_lora_b), 0)
+
+    def test_phi4mm_set_modality_skips_when_no_lora(self):
+        """set_modality should no-op when _base_weights is empty (quantized model)."""
+        from mlx_vlm.models import phi4mm
+
+        config = self._tiny_config()
+        model = phi4mm.Model(config)
+        model._base_weights = {}
+
+        # Should not raise even with modality flags set
+        model.set_modality(has_image=True, has_audio=True)
 
 
 if __name__ == "__main__":

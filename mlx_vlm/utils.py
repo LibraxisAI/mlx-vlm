@@ -34,6 +34,7 @@ MODEL_REMAPPING = {
     "lfm2-vl": "lfm2_vl",
     "cohere2_vision": "aya_vision",
     "jvlm": "jina_vlm",
+    "phi4-siglip": "phi4_siglip",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -736,48 +737,36 @@ def save_config(
 
 def load_image(image_source: Union[str, Path, BytesIO], timeout: int = 10):
     """
-    Helper function to load an image from either a URL or file.
+    Helper function to load an image from either a URL, file path, data URI,
+    or BytesIO object.
     """
-    if (
-        isinstance(image_source, BytesIO)
-        or (isinstance(image_source, str) and image_source.startswith("data:image/"))
-        or Path(image_source).is_file()
-    ):
-        # for base64 encoded images
-        try:
-            if image_source.startswith("data:image/"):
-                import base64
+    import base64
 
-                if "," not in image_source:
-                    raise ValueError(
-                        "Invalid data URI format - missing comma separator"
-                    )
-
-                _, data = image_source.split(",", 1)
-                image_source = BytesIO(base64.b64decode(data))
-
-            image = Image.open(image_source)
-        except IOError as e:
+    try:
+        if not isinstance(image_source, (str, Path, BytesIO)):
             raise ValueError(
-                f"Failed to load image from {image_source} with error: {e}"
-            ) from e
-    elif image_source.startswith(("http://", "https://")):
-        try:
+                f"Unsupported image source type: {type(image_source).__name__}"
+            )
+        if isinstance(image_source, str) and image_source.startswith("data:image/"):
+            if "," not in image_source:
+                raise ValueError("Invalid data URI format - missing comma separator")
+            _, data = image_source.split(",", 1)
+            image_source = BytesIO(base64.b64decode(data))
+        if isinstance(image_source, str) and image_source.startswith(
+            ("http://", "https://")
+        ):
             response = requests.get(image_source, stream=True, timeout=timeout)
             response.raise_for_status()
-            image = Image.open(response.raw)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to load image from URL: {image_source} with error {e}"
-            ) from e
-    else:
-        raise ValueError(
-            f"The image {image_source} must be a valid URL or existing file."
-        )
+            image_source = response.raw
+
+        image = Image.open(image_source)
+    except ValueError:
+        raise
+    except Exception as e:
+        raise ValueError(f"Failed to load image from {image_source}: {e}") from e
 
     image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    return image
+    return image.convert("RGB")
 
 
 def resize_image(img, max_size):
@@ -832,14 +821,18 @@ def resample_audio(audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarra
 
 
 def load_audio(
-    file: str,
+    file,
     sr: int,
     timeout: int = 10,
 ):
     """
-    Helper function to load audio from either a URL or file.
+    Helper function to load audio from either a URL, file path, or numpy array.
     """
-    if file.startswith(("http://", "https://")):
+    if isinstance(file, np.ndarray):
+        return file
+    if isinstance(file, Path):
+        file = str(file)
+    if isinstance(file, str) and file.startswith(("http://", "https://")):
         try:
             response = requests.get(file, stream=True, timeout=timeout)
             response.raise_for_status()
@@ -898,8 +891,12 @@ def process_inputs(
     if audio is not None and len(audio) > 0:
         if "audio" in parameters:
             args["audio"] = audio
+        elif "audios" in parameters:
+            args["audios"] = audio
         else:
-            raise ValueError(f"Processor {processor} does not support audio parameter")
+            raise ValueError(
+                f"Processor {processor.__class__.__name__} does not support audio parameter"
+            )
 
     return process_method(**args)
 
@@ -960,7 +957,11 @@ def prepare_inputs(
     **kwargs,
 ):
 
-    if not images and not audio:
+    has_images = images is not None and (
+        not hasattr(images, "__len__") or len(images) > 0
+    )
+    has_audio = audio is not None and (not hasattr(audio, "__len__") or len(audio) > 0)
+    if not has_images and not has_audio:
         tokenizer = (
             processor.tokenizer if hasattr(processor, "tokenizer") else processor
         )
@@ -1101,16 +1102,14 @@ def prepare_inputs(
             )
         else:
             feature_extractor = getattr(processor, "feature_extractor", None)
-            if feature_extractor is not None:
-                audio = [
-                    load_audio(audio_file, sr=feature_extractor.sampling_rate)
-                    for audio_file in audio
-                ]
-            else:
-                audio = [
-                    load_audio(audio_file, sr=processor.feature_extractor.sampling_rate)
-                    for audio_file in audio
-                ]
+            sr = (
+                getattr(feature_extractor, "sampling_rate", 16000)
+                if feature_extractor is not None
+                else 16000
+            )
+            audio = [load_audio(audio_file, sr=sr) for audio_file in audio]
+            # Convert to (data, sr) tuples for processors that expect them
+            audio = [(a, sr) if isinstance(a, np.ndarray) else a for a in audio]
 
     model_inputs = {}
 
@@ -1170,7 +1169,9 @@ def prepare_inputs(
         # Convert inputs to model_inputs with mx.array if present
         for key, value in inputs.items():
             if key not in model_inputs:
-                if isinstance(value, (str, list, mx.array)):
+                if value is None:
+                    model_inputs[key] = value
+                elif isinstance(value, (str, list, mx.array)):
                     model_inputs[key] = value
                 else:
                     model_inputs[key] = mx.array(value)
@@ -1294,6 +1295,87 @@ class StoppingCriteria:
 
     def __call__(self, input_ids: mx.array) -> bool:
         return input_ids in self.eos_token_ids
+
+
+class ThinkingBudgetCriteria:
+    """
+    Enforces a budget on thinking tokens.
+
+    Tracks tokens within thinking blocks (between start and end tokens) and
+    forces a closing sequence (e.g. ``\\n</think>``) when budget is exceeded.
+    """
+
+    def __init__(
+        self,
+        tokenizer,
+        thinking_budget: int,
+        thinking_end_token: str = "</think>",
+        thinking_start_token: Optional[str] = None,
+        enable_thinking: bool = False,
+    ):
+        self.tokenizer = tokenizer
+        self.thinking_budget = thinking_budget
+        self.enable_thinking = enable_thinking
+
+        # Resolve token IDs from strings
+        self.thinking_end_token_id = tokenizer.encode(
+            thinking_end_token, add_special_tokens=False
+        )[-1]
+
+        self.thinking_start_token_id = tokenizer.encode(
+            thinking_start_token, add_special_tokens=False
+        )[-1]
+
+        self._forced_sequence: List[int] = []
+        newline_ids = tokenizer.encode("\n", add_special_tokens=False)
+        if newline_ids:
+            self._forced_sequence.append(newline_ids[-1])
+        self._forced_sequence.append(self.thinking_end_token_id)
+        self._forced_index = 0
+
+        self.in_thinking = self.enable_thinking
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+
+    def reset_thinking_state(self):
+        """Reset thinking state between generations."""
+        self.in_thinking = self.enable_thinking
+        self.thinking_token_count = 0
+        self.budget_exceeded = False
+        self._forced_index = 0
+
+    def __call__(self, token_id: int) -> Optional[int]:
+        """Process a token and return a forced token ID if budget exceeded, else None."""
+        if self.enable_thinking and token_id == self.thinking_start_token_id:
+            self.in_thinking = True
+            return None
+
+        if token_id == self.thinking_end_token_id:
+            self.in_thinking = False
+            self.budget_exceeded = False
+            self._forced_index = 0
+            return None
+
+        if self.in_thinking:
+            self.thinking_token_count += 1
+            if self.thinking_token_count > self.thinking_budget:
+                self.budget_exceeded = True
+
+        if self.budget_exceeded and self._forced_index < len(self._forced_sequence):
+            forced = self._forced_sequence[self._forced_index]
+            self._forced_index += 1
+            self.forced_token_id = forced
+            return forced
+
+        self.forced_token_id = None
+        return None
+
+    def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
+        if self.forced_token_id is not None and self.enable_thinking:
+            next_y = mx.array([self.forced_token_id])
+            self.forced_token_id = None
+            return next_y
+        return next_y
 
 
 def print_array_report(t: mx.array, label: Optional[str]) -> dict:
