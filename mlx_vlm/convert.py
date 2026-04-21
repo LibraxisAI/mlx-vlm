@@ -195,8 +195,8 @@ def convert(
 
     save_weights(mlx_path, model, donate_weights=True)
 
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
+    # Copy Python, JSON, and model card files from the model path to the MLX path
+    for pattern in ["*.py", "*.json", "README.md"]:
         files = glob.glob(str(model_path / pattern))
         for file in files:
             # Skip the index file - save_weights() already generated the correct one

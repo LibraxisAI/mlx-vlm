@@ -589,25 +589,32 @@ def upload_to_hub(path: str, upload_repo: str, hf_path: str):
 
     from . import __version__
 
-    card = ModelCard.load(hf_path)
-    card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
-    card.text = dedent(
-        f"""
-        # {upload_repo}
-        This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
-        Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
-        ## Use with mlx
+    readme_path = Path(path) / "README.md"
+    if readme_path.exists():
+        readme_text = readme_path.read_text(encoding="utf-8")
+        readme_text = readme_text.replace("__UPLOAD_REPO__", upload_repo)
+        readme_text = readme_text.replace("__SOURCE_MODEL__", str(hf_path))
+        readme_path.write_text(readme_text, encoding="utf-8")
+    else:
+        card = ModelCard.load(hf_path)
+        card.data.tags = ["mlx"] if card.data.tags is None else card.data.tags + ["mlx"]
+        card.text = dedent(
+            f"""
+            # {upload_repo}
+            This model was converted to MLX format from [`{hf_path}`]() using mlx-vlm version **{__version__}**.
+            Refer to the [original model card](https://huggingface.co/{hf_path}) for more details on the model.
+            ## Use with mlx
 
-        ```bash
-        pip install -U mlx-vlm
-        ```
+            ```bash
+            pip install -U mlx-vlm
+            ```
 
-        ```bash
-        python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
-        ```
-        """
-    )
-    card.save(os.path.join(path, "README.md"))
+            ```bash
+            python -m mlx_vlm.generate --model {upload_repo} --max-tokens 100 --temperature 0.0 --prompt "Describe this image." --image <path_to_image>
+            ```
+            """
+        )
+        card.save(os.path.join(path, "README.md"))
 
     logging.set_verbosity_info()
 
