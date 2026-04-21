@@ -10,6 +10,7 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
+    get_model_and_args,
     get_class_predicate,
     load,
     load_image,
@@ -79,14 +80,6 @@ class MockProcessor:
             inputs = {k: mx.array(v) for k, v in data.items()}
             inputs["pixel_values"] = mx.zeros((4, 5, 6)) if images else []
             return inputs
-        # Simulate PyTorch tensor output
-        elif return_tensors == "pt":
-            try:
-                inputs = {k: MockTorch.tensor(v) for k, v in data.items()}
-                inputs["pixel_values"] = MockTorch.tensor([4, 5, 6]) if images else []
-                return inputs
-            except ImportError:
-                raise ImportError("PyTorch is not installed")
         else:
             raise ValueError(f"Unsupported return_tensors: {return_tensors}")
 
@@ -266,6 +259,13 @@ def test_quantize_module():
     }
 
 
+def test_get_model_and_args_maps_qwen36_vl_alias_to_qwen3_vl():
+    arch, model_type = get_model_and_args({"model_type": "qwen3_6_vl"})
+
+    assert model_type == "qwen3_vl"
+    assert arch.__name__.endswith("qwen3_vl")
+
+
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
@@ -326,40 +326,16 @@ def test_prepare_inputs():
 def test_process_inputs_with_fallback():
 
     processor = MockProcessor()
-
-    # Test MLX tensor output
-    inputs = process_inputs_with_fallback(
-        processor, images=None, audio=None, prompts="test", return_tensors="mlx"
-    )
-    assert isinstance(inputs["input_ids"], mx.array)
-    assert isinstance(inputs["attention_mask"], mx.array)
-
     try:
-        # Test PyTorch tensor output with fallback
+        # Test MLX tensor output
         inputs = process_inputs_with_fallback(
-            processor, images=None, audio=None, prompts="test", return_tensors="pt"
+            processor, images=None, audio=None, prompts="test", return_tensors="mlx"
         )
-        # Check if the tensors have PyTorch-like attributes without importing torch
-        assert hasattr(inputs["input_ids"], "numpy") and hasattr(
-            inputs["input_ids"], "detach"
-        )
-        assert hasattr(inputs["attention_mask"], "numpy") and hasattr(
-            inputs["attention_mask"], "detach"
-        )
+        assert isinstance(inputs["input_ids"], mx.array)
+        assert isinstance(inputs["attention_mask"], mx.array)
+
     except ImportError:
-        # Test PyTorch not installed scenario
-        with patch("builtins.__import__", side_effect=ImportError):
-            with pytest.raises(
-                ValueError,
-                match="Failed to process inputs with error.*PyTorch is not installed.*Please install PyTorch",
-            ):
-                process_inputs_with_fallback(
-                    processor,
-                    images=None,
-                    audio=None,
-                    prompts="test",
-                    return_tensors="pt",
-                )
+        raise ImportError("MLX is not installed")
 
 
 def test_stopping_criteria():
@@ -414,14 +390,8 @@ def test_load_passes_revision():
 
     with (
         patch("mlx_vlm.utils.get_model_path") as mock_get_model_path,
-        patch(
-            "mlx_vlm.utils.load_model",
-            return_value=model_mock,
-        ) as mock_load_model,
-        patch(
-            "mlx_vlm.utils.load_processor",
-            return_value=processor_mock,
-        ) as mock_load_processor,
+        patch("mlx_vlm.utils.load_model", return_value=model_mock),
+        patch("mlx_vlm.utils.load_processor", return_value=processor_mock),
         patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")

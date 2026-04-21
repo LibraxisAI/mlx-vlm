@@ -6,12 +6,50 @@ from typing import Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 from mlx_lm.models.base import (
-    create_attention_mask,
-    create_ssm_mask,
-    scaled_dot_product_attention,
+    scaled_dot_product_attention as mlx_scaled_dot_product_attention,
 )
 from PIL import Image
+
+from ..turboquant import BatchTurboQuantKVCache, TurboQuantKVCache
+
+
+def load_chat_template(tokenizer, model_path):
+    """Apply a chat template from the model directory to *tokenizer*."""
+    import json
+    from pathlib import Path
+
+    model_dir = Path(model_path)
+    chat_template_json = model_dir / "chat_template.json"
+    chat_template_jinja = model_dir / "chat_template.jinja"
+
+    if chat_template_json.exists():
+        template_data = json.loads(chat_template_json.read_text())
+        tokenizer.chat_template = template_data["chat_template"]
+    elif chat_template_jinja.exists():
+        tokenizer.chat_template = chat_template_jinja.read_text()
+
+    return tokenizer
+
+
+def to_mlx(data: dict) -> dict:
+    """Convert all array-like values in a processor output dict to mx.array."""
+    result = {}
+    for key, value in data.items():
+        if value is None or isinstance(value, mx.array):
+            result[key] = value
+        elif isinstance(value, np.ndarray):
+            result[key] = mx.array(value)
+        elif isinstance(value, list):
+            try:
+                result[key] = mx.array(np.array(value))
+            except (ValueError, TypeError):
+                result[key] = value
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass
@@ -20,6 +58,7 @@ class LanguageModelOutput:
     hidden_states: Optional[List[mx.array]] = None
     cross_attention_states: Optional[List[mx.array]] = None
     encoder_outputs: Optional[List[mx.array]] = None
+    gdn_states: Optional[List] = None
 
 
 @dataclass
@@ -34,6 +73,9 @@ class InputEmbeddingsFeatures:
     full_text_row_masked_out_mask: Optional[mx.array] = None
     decoder_inputs_embeds: Optional[mx.array] = None
     attention_mask: Optional[mx.array] = None  # For encoder-decoder models
+    position_ids: Optional[mx.array] = None
+    pos_hw: Optional[mx.array] = None
+    rope_deltas: Optional[mx.array] = None
 
     def to_dict(self):
         return {
@@ -47,6 +89,9 @@ class InputEmbeddingsFeatures:
             "full_text_row_masked_out_mask": self.full_text_row_masked_out_mask,
             "decoder_inputs_embeds": self.decoder_inputs_embeds,
             "attention_mask": self.attention_mask,
+            "position_ids": self.position_ids,
+            "pos_hw": self.pos_hw,
+            "rope_deltas": self.rope_deltas,
         }
 
 
@@ -54,6 +99,8 @@ class InputEmbeddingsFeatures:
 class BaseModelConfig:
     @classmethod
     def from_dict(cls, params):
+        if not params:
+            return cls()
         return cls(
             **{
                 k: v
@@ -140,6 +187,65 @@ class BaseImageProcessor:
     @abstractmethod
     def preprocess(self, images):
         pass
+
+
+def scaled_dot_product_attention(
+    queries,
+    keys,
+    values,
+    cache,
+    scale: float,
+    mask: Optional[mx.array],
+    sinks: Optional[mx.array] = None,
+) -> mx.array:
+    if isinstance(cache, TurboQuantKVCache):
+        if sinks is not None:
+            raise ValueError("TurboQuant KV cache does not support attention sinks.")
+        if queries.shape[-2] == 1:
+            return cache.decode_attention(
+                queries,
+                keys_state=keys,
+                values_state=values,
+                scale=scale,
+                mask=mask,
+            )
+        result = cache.prefill_attention(
+            queries,
+            keys_state=keys,
+            values_state=values,
+            scale=scale,
+            mask=mask,
+        )
+        if result is not None:
+            return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    if isinstance(cache, BatchTurboQuantKVCache):
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
+    return mlx_scaled_dot_product_attention(
+        queries,
+        keys,
+        values,
+        cache=cache,
+        scale=scale,
+        mask=mask,
+        sinks=sinks,
+    )
 
 
 def expand2square(pil_img, background_color):
@@ -357,6 +463,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
 
             model_type = str(cfg.get("model_type", "")).lower()
             if model_type in target_model_types:
+                kwargs.setdefault("trust_remote_code", True)
                 return processor_cls.from_pretrained(
                     pretrained_model_name_or_path, **kwargs
                 )
@@ -364,7 +471,7 @@ def install_auto_processor_patch(target_model_types, processor_cls):
             # On any failure, fall back to previous behavior
             pass
 
-        # Chain to the prior from_pretrained (which may already be patched)
+        # Chain to the prior from_pretrained
         return previous_from_pretrained.__func__(
             cls, pretrained_model_name_or_path, **kwargs
         )

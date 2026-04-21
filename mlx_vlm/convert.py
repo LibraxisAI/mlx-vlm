@@ -11,6 +11,7 @@ from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
+    create_model_card,
     fetch_from_hub,
     get_model_path,
     save_config,
@@ -216,8 +217,11 @@ def convert(
 
     save_config(config, config_path=mlx_path / "config.json")
 
+    hf_repo = None if Path(hf_path).exists() else hf_path
+    create_model_card(mlx_path, hf_repo)
+
     if upload_repo is not None:
-        upload_to_hub(mlx_path, upload_repo, hf_path)
+        upload_to_hub(mlx_path, upload_repo)
 
 
 def configure_parser() -> argparse.ArgumentParser:
@@ -276,7 +280,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,

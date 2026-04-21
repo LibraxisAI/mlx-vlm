@@ -2,8 +2,6 @@ from enum import Enum
 from functools import partial
 from typing import Any, Dict, List, Union
 
-from pydantic import BaseModel
-
 
 class MessageFormat(Enum):
     """Enum for different message format types."""
@@ -41,8 +39,13 @@ MODEL_CONFIG = {
     "qwen2_5_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3.6-vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_6_vl": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3.6-vl-moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_6_vl_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "qwen3_5_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "qwen3_omni_moe": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "minicpmo": MessageFormat.IMAGE_TOKEN,
     "mistral3": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "glm4v": MessageFormat.LIST_WITH_IMAGE_FIRST,
@@ -52,15 +55,20 @@ MODEL_CONFIG = {
     "ernie4_5_moe_vl": MessageFormat.LIST_WITH_IMAGE_URL_FIRST,
     "internvl_chat": MessageFormat.LIST_WITH_IMAGE_TYPE,
     "kimi_vl": MessageFormat.LIST_WITH_IMAGE,
+    "kimi_k25": MessageFormat.LIST_WITH_IMAGE,
     "gemma3": MessageFormat.START_IMAGE_TOKEN,
     "gemma3n": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
+    "gemma4": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "llama4": MessageFormat.LIST_WITH_IMAGE,
     "smolvlm": MessageFormat.LIST_WITH_IMAGE_FIRST,
     "llava": MessageFormat.LIST_WITH_IMAGE,
     "llava_next": MessageFormat.LIST_WITH_IMAGE,
+    "granite_vision": MessageFormat.LIST_WITH_IMAGE,
+    "granite4_vision": MessageFormat.LIST_WITH_IMAGE,
     "mllama": MessageFormat.LIST_WITH_IMAGE,
     "pixtral": MessageFormat.LIST_WITH_IMAGE_TYPE_TEXT,
     "molmo2": MessageFormat.LIST_WITH_IMAGE_FIRST,
+    "molmo_point": MessageFormat.LIST_WITH_IMAGE_FIRST,
     # Token-based models
     "llava-qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,
     "llava_qwen2": MessageFormat.IMAGE_TOKEN_NEWLINE,  # fastvlm
@@ -77,6 +85,7 @@ MODEL_CONFIG = {
     "florence2": MessageFormat.PROMPT_ONLY,
     "molmo": MessageFormat.PROMPT_ONLY,
     "moondream3": MessageFormat.PROMPT_ONLY,
+    "falcon_ocr": MessageFormat.PROMPT_ONLY,
     "paligemma": MessageFormat.PROMPT_WITH_IMAGE_TOKEN,
 }
 
@@ -88,6 +97,7 @@ SINGLE_IMAGE_ONLY_MODELS = {
     "paligemma",
     "multi_modality",
     "mllama",
+    "falcon_ocr",
 }
 
 
@@ -128,6 +138,15 @@ def extract_text_from_content(content: Any) -> str:
 
     # Fallback: convert to string (shouldn't happen in normal usage)
     return str(content) if content else ""
+
+
+def _get_role_content(item: Any) -> Union[tuple[str, Any], None]:
+    """Return (role, content) for a message-like item (dict or object with .role/.content), else None."""
+    if isinstance(item, dict):
+        return item.get("role", "user"), item.get("content")
+    if hasattr(item, "role") and hasattr(item, "content"):
+        return getattr(item, "role", "user"), getattr(item, "content", "")
+    return None
 
 
 class MessageBuilder:
@@ -207,6 +226,7 @@ class MessageFormatter:
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen3_omni_moe",
         ] and kwargs.get("video"):
             return self._format_video_message(prompt, kwargs)
 
@@ -372,13 +392,9 @@ class MessageFormatter:
             # Build prefix: images first, then audio (matches HF model format)
             prefix_parts = []
             if not skip_image_token and num_images > 0:
-                # phi3_v uses single token regardless of num_images
-                if self.model_name == "phi3_v":
-                    prefix_parts.append("<|image_1|>")
-                else:
-                    prefix_parts.append(
-                        "".join([f"<|image_{i+1}|>" for i in range(num_images)])
-                    )
+                prefix_parts.append(
+                    "".join([f"<|image_{i+1}|>" for i in range(num_images)])
+                )
             if not skip_audio_token and num_audios > 0:
                 prefix_parts.append(
                     "".join([f"<|audio_{i+1}|>" for i in range(num_audios)])
@@ -481,7 +497,8 @@ def get_chat_template(
 
         if isinstance(content, list):
             parts = []
-            multimodal_markers = {image_token, "<audio>", "<video>"}
+            audio_marker = kwargs.get("audio_token", "<audio>")
+            multimodal_markers = {image_token, audio_marker, "<audio>", "<video>"}
             for item in content:
                 if isinstance(item, dict):
                     item_type = item.get("type", "")
@@ -553,11 +570,11 @@ def get_chat_template(
         for message in normalized:
             role = message.get("role", "user")
             content = message.get("content", "")
-            if role in ("system", "user", "assistant"):
+            if role in ("system", "user", "assistant", "tool"):
                 prefix = role.capitalize()
                 lines.append(f"{prefix}: {content}" if content else f"{prefix}:")
             else:
-                lines.append(content)
+                lines.append(content if content else "")
 
         if add_generation_prompt:
             lines.append("Assistant:")
@@ -677,54 +694,62 @@ def apply_chat_template(
             )
         )
     elif isinstance(prompt, list):
-        # List of prompts
+        # List of prompts — find the last user message to place image/audio tokens
+        last_user_idx = -1
         for i, p in enumerate(prompt):
             if isinstance(p, str):
-                is_first = i == 0
+                last_user_idx = i
+            elif (rc := _get_role_content(p)) is not None:
+                if rc[0] not in ("system", "assistant", "tool"):
+                    last_user_idx = i
+
+        for i, p in enumerate(prompt):
+            if isinstance(p, str):
+                is_target = i == last_user_idx
                 messages.append(
                     get_message_json(
                         model_type,
                         p,
-                        skip_image_token=not is_first,
-                        skip_audio_token=not is_first,
+                        skip_image_token=not is_target,
+                        skip_audio_token=not is_target,
                         num_images=num_images,
                         num_audios=num_audios,
                         **kwargs,
                     )
                 )
-            elif isinstance(p, dict) or isinstance(p, BaseModel):
-                role = "user"
-                content = ""
-                if isinstance(p, dict):
-                    role = p.get("role", "user")
-                    content = p.get("content")
+            elif (role_content := _get_role_content(p)) is not None:
+                role, content = role_content
+                # Tool-calling messages: pass through as-is to preserve
+                # tool_calls, tool_call_id, name for the Jinja template.
+                has_tool_metadata = isinstance(p, dict) and (
+                    "tool_calls" in p or "tool_call_id" in p or role == "tool"
+                )
+                if has_tool_metadata:
+                    messages.append(p)
                 else:
-                    role = p.role
-                    content = p.content
-                # Handle multimodal content: extract only text, skip image/audio URLs
-                # This prevents base64 image data from being tokenized as text
-                content = extract_text_from_content(content)
-                is_first = i == 0 or (i == 1 and role not in ["system", "assistant"])
-                messages.append(
-                    get_message_json(
-                        model_type,
-                        content,
-                        role,
-                        skip_image_token=not is_first
-                        or role in ["system", "assistant"],
-                        skip_audio_token=not is_first
-                        or role in ["system", "assistant"],
-                        num_images=num_images,
-                        num_audios=num_audios,
-                        **kwargs,
+                    # Handle multimodal content: extract only text, skip image/audio URLs
+                    content = extract_text_from_content(content)
+                    is_target = i == last_user_idx
+                    messages.append(
+                        get_message_json(
+                            model_type,
+                            content,
+                            role,
+                            skip_image_token=not is_target
+                            or role in ["system", "assistant"],
+                            skip_audio_token=not is_target
+                            or role in ["system", "assistant"],
+                            num_images=num_images,
+                            num_audios=num_audios,
+                            **kwargs,
+                        )
                     )
-                )
 
     if return_messages:
         return messages
 
     # Some models only need the last message
-    if model_type in ["paligemma", "molmo", "florence2"]:
+    if model_type in ["paligemma", "molmo", "florence2", "falcon_ocr"]:
         return messages[-1]
 
     return get_chat_template(processor, messages, add_generation_prompt, **kwargs)
