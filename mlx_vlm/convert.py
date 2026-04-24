@@ -7,6 +7,7 @@ from typing import Callable, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map_with_path
+from mlx_lm.utils import dequantize_model, quantize_model
 
 from .utils import (
     MODEL_CONVERSION_DTYPES,
@@ -156,7 +157,24 @@ def convert(
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
-        from mlx_lm.utils import quantize_model
+        # Materialize lazy weights in chunks BEFORE quantization to avoid
+        # GPU timeout on very large models (235B+).  The model is loaded
+        # with lazy=True, so all weights are deferred.  Quantizing on top
+        # of lazy weights creates a deep computation graph that exceeds
+        # the Metal command buffer timeout when evaluated all at once.
+        from mlx.utils import tree_flatten as _tree_flatten
+
+        params = dict(_tree_flatten(model.parameters()))
+        keys = list(params.keys())
+        total = len(keys)
+        print(f"[INFO] Materializing {total} tensors one by one...")
+        for i, k in enumerate(keys):
+            mx.eval(params[k])
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"  [{i + 1}/{total}] {k} {params[k].shape}", flush=True)
+        print(f"  [{total}/{total}] done.")
+        del params
+        mx.clear_cache()
 
         print("[INFO] Quantizing")
         config.setdefault("vision_config", {})
@@ -170,8 +188,6 @@ def convert(
         )
 
     if dequantize:
-        from mlx_lm.utils import dequantize_model
-
         print("[INFO] Dequantizing")
         model = dequantize_model(model)
 
@@ -180,8 +196,8 @@ def convert(
 
     save_weights(mlx_path, model, donate_weights=True)
 
-    # Copy Python and JSON files from the model path to the MLX path
-    for pattern in ["*.py", "*.json"]:
+    # Copy Python, JSON, and model card files from the model path to the MLX path
+    for pattern in ["*.py", "*.json", "README.md"]:
         files = glob.glob(str(model_path / pattern))
         for file in files:
             # Skip the index file - save_weights() already generated the correct one
@@ -264,7 +280,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,
