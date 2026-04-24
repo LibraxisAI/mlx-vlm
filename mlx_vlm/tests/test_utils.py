@@ -10,6 +10,7 @@ from mlx_lm.utils import quantize_model
 
 from mlx_vlm.utils import (
     StoppingCriteria,
+    get_model_and_args,
     get_class_predicate,
     load,
     load_image,
@@ -258,6 +259,13 @@ def test_quantize_module():
     }
 
 
+def test_get_model_and_args_maps_qwen36_vl_alias_to_qwen3_vl():
+    arch, model_type = get_model_and_args({"model_type": "qwen3_6_vl"})
+
+    assert model_type == "qwen3_vl"
+    assert arch.__name__.endswith("qwen3_vl")
+
+
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
@@ -382,14 +390,8 @@ def test_load_passes_revision():
 
     with (
         patch("mlx_vlm.utils.get_model_path") as mock_get_model_path,
-        patch(
-            "mlx_vlm.utils.load_model",
-            return_value=model_mock,
-        ) as mock_load_model,
-        patch(
-            "mlx_vlm.utils.load_processor",
-            return_value=processor_mock,
-        ) as mock_load_processor,
+        patch("mlx_vlm.utils.load_model", return_value=model_mock),
+        patch("mlx_vlm.utils.load_processor", return_value=processor_mock),
         patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")

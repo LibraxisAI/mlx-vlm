@@ -1,6 +1,6 @@
 """Tests for prompt_utils module, specifically multimodal content handling."""
 
-from mlx_vlm.prompt_utils import extract_text_from_content
+from mlx_vlm.prompt_utils import MessageFormatter, extract_text_from_content
 
 
 class TestExtractTextFromContent:
@@ -224,6 +224,30 @@ class TestApplyChatTemplateIntegration:
                         assert "iVBOR" not in str(
                             text
                         ), "Base64 data leaked into text content!"
+
+
+class TestQwen36Aliases:
+    def test_qwen36_vl_alias_matches_qwen3_vl_message_shape(self):
+        alias_formatter = MessageFormatter("qwen3_6_vl")
+        canonical_formatter = MessageFormatter("qwen3_vl")
+
+        alias_result = alias_formatter.format_message("Describe this image", num_images=1)
+        canonical_result = canonical_formatter.format_message(
+            "Describe this image", num_images=1
+        )
+
+        assert alias_result == canonical_result
+
+    def test_qwen36_vl_moe_alias_matches_qwen3_vl_moe_message_shape(self):
+        alias_formatter = MessageFormatter("qwen3_6_vl_moe")
+        canonical_formatter = MessageFormatter("qwen3_vl_moe")
+
+        alias_result = alias_formatter.format_message("Describe this image", num_images=1)
+        canonical_result = canonical_formatter.format_message(
+            "Describe this image", num_images=1
+        )
+
+        assert alias_result == canonical_result
 
     def test_pydantic_basemodel_content_extraction(self):
         """Test that BaseModel message objects are handled correctly."""

@@ -43,6 +43,10 @@ MODEL_REMAPPING = {
     "rf-detr": "rfdetr",
     "falcon-perception": "falcon_perception",
     "nemotronh_nano_omni_reasoning_v3": "nemotron_h_nano_omni",
+    "qwen3.6-vl": "qwen3_vl",
+    "qwen3_6_vl": "qwen3_vl",
+    "qwen3.6-vl-moe": "qwen3_vl_moe",
+    "qwen3_6_vl_moe": "qwen3_vl_moe",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -100,6 +104,30 @@ def skip_multimodal_module(path: str) -> bool:
         "multi_modal_projector",
     )
     return any(module in path for module in multimodal_modules)
+
+
+def get_class_predicate(
+    skip_vision: bool = False,
+    weights: Optional[dict[str, Any]] = None,
+    quantization: Optional[dict[str, Any]] = None,
+):
+    """Build the quantization predicate used for mixed multimodal models."""
+
+    def _predicate(path, module):
+        # Keep multimodal towers out when requested by the model config.
+        if skip_multimodal_module(path) and skip_vision:
+            return False
+        if quantization is not None and path in quantization:
+            return quantization[path]
+        if not hasattr(module, "to_quantized"):
+            return False
+        if hasattr(module, "weight") and module.weight.size % 64 != 0:
+            return False
+        if weights is None:
+            return True
+        return f"{path}.scales" in weights
+
+    return _predicate
 
 
 def get_model_and_args(config: dict):
@@ -302,27 +330,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(
+                skip_vision=skip_vision,
+                weights=weights,
+                quantization=config["quantization"],
+            ),
         )
 
     if kwargs.get("quantize_activations", False):
@@ -541,11 +558,44 @@ def load_image_processor(model_path: Union[str, Path], **kwargs) -> BaseImagePro
     return image_processor
 
 
+def _patch_video_processor_mapping():
+    """Patch transformers video processor mapping when torchvision is missing.
+
+    Transformers >= 5.0.0rc1 sets VIDEO_PROCESSOR_MAPPING_NAMES values to None
+    when torchvision is unavailable, causing ``video_processor_class_from_name``
+    to crash with ``TypeError: argument of type 'NoneType' is not iterable``.
+    """
+    try:
+        from transformers.models.auto import video_processing_auto as vpa
+
+        mapping = getattr(vpa, "VIDEO_PROCESSOR_MAPPING_NAMES", None)
+        if mapping is None:
+            vpa.VIDEO_PROCESSOR_MAPPING_NAMES = {}
+        else:
+            for key, value in list(mapping.items()):
+                if value is None:
+                    mapping[key] = ()
+    except ImportError:
+        pass
+
+
 def load_processor(
     model_path, add_detokenizer=True, eos_token_ids=None, **kwargs
 ) -> ProcessorMixin:
 
-    processor = AutoProcessor.from_pretrained(model_path, use_fast=True, **kwargs)
+    # sanitize processor config — pop trust_remote_code to avoid duplicate kwarg
+    # (fetch_from_hub forwards it via **kwargs and we hardcode it here)
+    kwargs.pop("trust_remote_code", None)
+    try:
+        processor = AutoProcessor.from_pretrained(model_path, use_fast=False, trust_remote_code=True, **kwargs)
+    except TypeError as e:
+        if "NoneType" in str(e) and "not iterable" in str(e):
+            # Transformers video processor mapping can be None when torchvision
+            # is not installed. Patch and retry.
+            _patch_video_processor_mapping()
+            processor = AutoProcessor.from_pretrained(model_path, use_fast=False, trust_remote_code=True, **kwargs)
+        else:
+            raise
     if add_detokenizer:
         detokenizer_class = load_tokenizer(model_path, return_tokenizer=False)
 
@@ -756,11 +806,20 @@ def save_weights(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
+        # Materialize this shard's lazy computation graph before saving.
+        # Without this, the entire model's deferred ops (dtype cast,
+        # quantization) can accumulate into a single Metal command buffer
+        # that exceeds the GPU timeout on very large models (235B+).
+        mx.eval(*shard.values())
+
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
         for weight_name in shard.keys():
             index_data["weight_map"][weight_name] = shard_name
         del shard
+
+        # Release GPU memory between shards
+        mx.clear_cache()
 
     index_data["weight_map"] = {
         k: index_data["weight_map"][k] for k in sorted(index_data["weight_map"])
