@@ -10,6 +10,7 @@ import math
 from typing import List, Optional, Tuple, Union
 
 import numpy as np
+from PIL import Image
 from transformers.feature_extraction_utils import BatchFeature
 from transformers.image_processing_utils import ImageProcessingMixin
 from transformers.image_utils import ImageInput
@@ -18,6 +19,21 @@ from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
 from transformers.video_processing_utils import BaseVideoProcessor
 
 from ..base import load_chat_template, to_mlx
+
+_IMAGE_PROCESSOR_KWARGS = {
+    "min_pixels",
+    "max_pixels",
+    "resized_height",
+    "resized_width",
+}
+
+
+def _pop_image_processor_kwargs(kwargs):
+    return {
+        name: kwargs.pop(name)
+        for name in list(kwargs.keys())
+        if name in _IMAGE_PROCESSOR_KWARGS
+    }
 
 
 def _smart_resize_video(
@@ -167,15 +183,34 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
             images = [images]
         return [_to_numpy_image(img) for img in images]
 
-    def _process_one(self, image: np.ndarray) -> Tuple[np.ndarray, List[int]]:
+    def _process_one(
+        self,
+        image: np.ndarray,
+        min_pixels: Optional[int] = None,
+        max_pixels: Optional[int] = None,
+        resized_height: Optional[int] = None,
+        resized_width: Optional[int] = None,
+    ) -> Tuple[np.ndarray, List[int]]:
         C, H, W = image.shape
-        resized_h, resized_w = _smart_resize_image(
-            H,
-            W,
-            factor=self.patch_size * self.merge_size,
-            min_pixels=self.min_pixels,
-            max_pixels=self.max_pixels,
-        )
+        factor = self.patch_size * self.merge_size
+        if (resized_height is None) != (resized_width is None):
+            raise ValueError(
+                "resized_height and resized_width must be provided together."
+            )
+        if resized_height is not None:
+            resized_h, resized_w = _smart_resize_image(
+                resized_height,
+                resized_width,
+                factor=factor,
+            )
+        else:
+            resized_h, resized_w = _smart_resize_image(
+                H,
+                W,
+                factor=factor,
+                min_pixels=self.min_pixels if min_pixels is None else min_pixels,
+                max_pixels=self.max_pixels if max_pixels is None else max_pixels,
+            )
         # Bicubic resize via PIL (same pattern as the video path).
         frame = _resize_video_frames(image[None, ...], resized_h, resized_w)[0]
 
@@ -226,8 +261,11 @@ class Qwen3VLImageProcessor(ImageProcessingMixin):
         ]
         all_patches = []
         all_thw = []
+        image_kwargs = {
+            name: kwargs[name] for name in _IMAGE_PROCESSOR_KWARGS if name in kwargs
+        }
         for v in imgs:
-            patches, thw = self._process_one(v)
+            patches, thw = self._process_one(v, **image_kwargs)
             all_patches.append(patches)
             all_thw.append(thw)
         return {
@@ -347,14 +385,50 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         flatten = patches.reshape(1, grid_t * grid_h * grid_w, C * tps * ps * ps)
         return flatten[0], [grid_t, grid_h, grid_w]
 
+    def _frame_to_array(self, frame) -> np.ndarray:
+        if isinstance(frame, Image.Image):
+            frame = frame.convert("RGB")
+        arr = np.asarray(frame)
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim != 3:
+            raise ValueError(
+                f"Expected video frame as (H, W, C) or (C, H, W), got shape {arr.shape}."
+            )
+        if arr.shape[0] in (1, 3, 4) and arr.shape[-1] not in (1, 3, 4):
+            arr = arr.transpose(1, 2, 0)
+        if arr.shape[-1] == 4 and self.do_convert_rgb:
+            arr = arr[..., :3]
+        return arr
+
+    def _prepare_video(self, video) -> np.ndarray:
+        if isinstance(video, np.ndarray) and video.dtype == object:
+            video = list(video)
+        if isinstance(video, list):
+            video = np.stack([self._frame_to_array(frame) for frame in video], axis=0)
+        elif not isinstance(video, np.ndarray):
+            video = np.asarray(video)
+
+        if video.ndim == 4 and video.shape[-1] in (1, 3, 4):
+            if video.shape[-1] == 4 and self.do_convert_rgb:
+                video = video[..., :3]
+            video = video.transpose(0, 3, 1, 2)
+        return video
+
+    def _is_video_frame(self, item) -> bool:
+        if isinstance(item, Image.Image):
+            return True
+        if isinstance(item, np.ndarray):
+            return item.ndim in (2, 3)
+        return False
+
     def __call__(self, videos, **kwargs):
-        if not isinstance(videos, list):
+        if not isinstance(videos, list) or (videos and self._is_video_frame(videos[0])):
             videos = [videos]
         all_patches = []
         all_thw = []
         for v in videos:
-            if not isinstance(v, np.ndarray):
-                v = np.asarray(v)
+            v = self._prepare_video(v)
             patches, thw = self._process_one(v)
             all_patches.append(patches)
             all_thw.append(thw)
@@ -544,9 +618,10 @@ class Qwen3VLProcessor(ProcessorMixin):
     ) -> BatchFeature:
         image_inputs = {}
         videos_inputs = {}
+        image_kwargs = _pop_image_processor_kwargs(kwargs)
 
         if images is not None:
-            image_inputs = self.image_processor(images=images)
+            image_inputs = self.image_processor(images=images, **image_kwargs)
             image_grid_thw = image_inputs["image_grid_thw"]
         else:
             image_grid_thw = None

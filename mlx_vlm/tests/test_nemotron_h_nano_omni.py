@@ -2,6 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from mlx_vlm.models.nemotron_h.language import NemotronHMamba2Mixer, NemotronHModel
 from mlx_vlm.models.nemotron_h_nano_omni.audio import (
     SoundEncoder,
     SoundFeatureExtractor,
@@ -40,6 +41,46 @@ def tiny_text_config(hidden_size=24):
         use_conv_bias=False,
         hybrid_override_pattern=["*"],
     )
+
+
+def test_nemotron_h_inputs_embeds_matches_token_ids():
+    config = tiny_text_config()
+    model = NemotronHModel(config)
+    input_ids = mx.array([[1, 2, 3]], dtype=mx.int32)
+    inputs_embeds = model.embeddings(input_ids)
+
+    from_ids = model(input_ids)
+    from_embeds = model(inputs_embeds=inputs_embeds)
+
+    assert mx.allclose(from_ids, from_embeds)
+
+
+def test_nemotron_h_embeddingless_backbone_requires_inputs_embeds():
+    config = tiny_text_config()
+    model = NemotronHModel(config, with_embeddings=False)
+    inputs_embeds = mx.zeros((1, 2, config.hidden_size))
+
+    output = model(inputs_embeds=inputs_embeds)
+
+    assert output.shape == inputs_embeds.shape
+    with pytest.raises(ValueError, match="no token embedding"):
+        model(mx.array([[1, 2]], dtype=mx.int32))
+
+
+def test_nemotron_h_mamba_skips_padded_projection_branches():
+    config = tiny_text_config()
+    mixer = NemotronHMamba2Mixer(config)
+    base_size = mixer.intermediate_size + mixer.conv_dim + mixer.num_heads
+    projected = mx.arange(base_size + 4)[None, None]
+
+    gate, conv_input, dt = mixer._split_projected_states(projected)
+
+    assert gate.shape[-1] == mixer.intermediate_size
+    assert conv_input.shape[-1] == mixer.conv_dim
+    assert dt.shape[-1] == mixer.num_heads
+    assert int(gate[0, 0, 0]) == 4
+    assert int(conv_input[0, 0, 0]) == 4 + mixer.intermediate_size
+    assert int(dt[0, 0, 0]) == 4 + mixer.intermediate_size + mixer.conv_dim
 
 
 def tiny_vision_config():
@@ -138,6 +179,50 @@ def test_model_merges_sound_features_into_input_embeddings():
         np.array(output.inputs_embeds[:, 1:4, :]),
         np.array(base_embeddings[:, 1:4, :]),
     )
+
+
+def test_audio_path_handles_nvfp4_uint8_lm_head_scales():
+    """Regression: nvfp4-quantized models pack lm_head.scales as uint8.
+
+    Before the fix, ``_extract_sound_features`` would cast the audio
+    ``input_features`` to ``scales.dtype`` and then crash inside the
+    subsampling Conv2d with::
+
+        ValueError: [conv] Invalid input array with type uint8.
+
+    The fix falls back to ``mx.bfloat16`` when ``scales.dtype`` is an
+    integer packing type (uint8 for nvfp4, uint32 for some other packed
+    modes). This test simulates that quant layout by attaching a uint8
+    ``scales`` attribute to a plain ``lm_head`` and verifying the audio
+    path completes without dtype error.
+    """
+    model = Model(
+        ModelConfig(
+            text_config=tiny_text_config(),
+            vision_config=tiny_vision_config(),
+            sound_config=tiny_sound_config(),
+            projector_hidden_size=32,
+            vit_hidden_size=16,
+            img_context_token_id=98,
+            sound_context_token_id=99,
+        )
+    )
+    model.eval()
+
+    # Simulate an nvfp4-quantized lm_head: presence of .scales with uint8 dtype.
+    model.language_model.lm_head.scales = mx.zeros((1,), dtype=mx.uint8)
+
+    input_ids = mx.array([[1, 99, 99, 99, 2]])
+    input_features = mx.random.normal((1, 17, 16))
+    feature_attention_mask = mx.ones((1, 17), dtype=mx.int32)
+
+    # Pre-fix: this raised ValueError from mx.conv2d.
+    output = model.get_input_embeddings(
+        input_ids,
+        input_features=input_features,
+        feature_attention_mask=feature_attention_mask,
+    )
+    assert np.isfinite(np.array(output.inputs_embeds)).all()
 
 
 def test_model_rejects_sound_token_feature_count_mismatch():

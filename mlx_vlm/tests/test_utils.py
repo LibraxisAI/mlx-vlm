@@ -1,20 +1,29 @@
 import base64
+import json
+import logging
+import struct
 from io import BytesIO
 from pathlib import Path
+from threading import Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from mlx_lm.utils import quantize_model
 
-from mlx_vlm.models.text_only import TextOnlyModel
+from mlx_vlm.convert import _preserve_existing_deepseek_v4_quantization
 from mlx_vlm.utils import (
     StoppingCriteria,
+    _drop_modules_without_weights,
+    _load_safetensors,
+    apply_generation_config_defaults,
     get_model_and_args,
     get_class_predicate,
+    get_model_path,
+
     load,
+    load_config,
     load_image,
     load_model,
     load_processor,
@@ -43,7 +52,10 @@ class MockTorch:
 
 
 class MockProcessor:
-    def __init__(self):
+    def __init__(self, tokenizer_return_value=None):
+        self.image_token = "<image>"
+        _return_value = tokenizer_return_value
+
         class DummyTokenizer:
             def __init__(self):
                 self.pad_token = None
@@ -60,6 +72,8 @@ class MockProcessor:
                 del text, add_special_tokens, padding, padding_side
                 if return_tensors != "mlx":
                     raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+                if _return_value is not None:
+                    return _return_value
                 return SimpleNamespace(
                     input_ids=mx.array([[1, 2, 3]]),
                     attention_mask=mx.array([[7, 8, 9]]),
@@ -105,6 +119,57 @@ class MockProcessor:
             return inputs
         else:
             raise ValueError(f"Unsupported return_tensors: {return_tensors}")
+
+
+def test_load_config_applies_generation_config_sampling_defaults(tmp_path):
+    generation_config = {
+        "eos_token_id": [2, 3],
+        "do_sample": True,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 64,
+        "max_new_tokens": 4096,
+    }
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "demo", "eos_token_id": 1}),
+        encoding="utf-8",
+    )
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(generation_config),
+        encoding="utf-8",
+    )
+
+    config = load_config(tmp_path)
+
+    assert config["generation_config"] == generation_config
+    assert config["eos_token_id"] == [2, 3]
+    assert config["do_sample"] is True
+    assert config["temperature"] == 1.0
+    assert config["top_p"] == 0.95
+    assert config["top_k"] == 64
+    assert "max_new_tokens" not in config
+
+
+def test_apply_generation_config_defaults_preserves_model_config_signature():
+    class ModelConfig:
+        pass
+
+    model_config = apply_generation_config_defaults(
+        ModelConfig(),
+        {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 64,
+            "do_sample": True,
+            "max_new_tokens": 4096,
+        },
+    )
+
+    assert model_config.temperature == 1.0
+    assert model_config.top_p == 0.95
+    assert model_config.top_k == 64
+    assert model_config.do_sample is True
+    assert not hasattr(model_config, "max_new_tokens")
 
 
 def test_sanitize_weights():
@@ -166,7 +231,22 @@ def test_update_module_configs():
     assert updated.vision_config == "vision_config"
 
 
+def test_get_model_path_downloads_jsonl_tokenizers(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("mlx_vlm.utils.snapshot_download", fake_snapshot_download)
+
+    assert get_model_path("org/model") == tmp_path
+    assert "*.jsonl" in captured["allow_patterns"]
+
+
 def test_quantize_module():
+    from mlx_vlm.quant_utils import quantize_model
+
     class DummyModule(nn.Module):
         def __init__(self, shape):
             super().__init__()
@@ -252,11 +332,55 @@ def test_get_model_and_args_maps_qwen36_vl_alias_to_qwen3_vl():
     assert arch.__name__.endswith("qwen3_vl")
 
 
+def test_convert_preserves_existing_deepseek_v4_quantization():
+    config = {
+        "model_type": "deepseek_v4",
+        "quantization_config": {"quant_method": "fp8"},
+    }
+    existing_quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.model.layers.0.attn.wkv": {
+            "group_size": 32,
+            "bits": 8,
+            "mode": "mxfp8",
+        },
+    }
+
+    with patch(
+        "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+        return_value=existing_quantization,
+    ):
+        _preserve_existing_deepseek_v4_quantization(
+            config,
+            model=MagicMock(),
+            q_group_size=64,
+            q_bits=4,
+            q_mode="affine",
+        )
+
+    assert config["quantization"] is config["quantization_config"]
+    assert config["quantization"]["group_size"] == 64
+    assert config["quantization"]["bits"] == 4
+    assert config["quantization"]["mode"] == "affine"
+    assert config["quantization"]["language_model.model.layers.0.attn.wkv"] == {
+        "group_size": 32,
+        "bits": 8,
+        "mode": "mxfp8",
+    }
+
+
+
 def test_prepare_inputs():
     """Test prepare_inputs function."""
 
+    # Define tokenizer return values
+    tok_result = MagicMock()
+    tok_result.input_ids = [[1, 2, 3]]
+    tok_result.attention_mask = [7, 8, 9]
     # Mock processor
-    processor = MockProcessor()
+    processor = MockProcessor(tokenizer_return_value=tok_result)
 
     # Test text-only input
     inputs = prepare_inputs(
@@ -306,6 +430,37 @@ def test_prepare_inputs():
     )
     assert "input_ids" in inputs
     assert mx.array_equal(inputs["input_ids"], mx.array([[1, 2, 3]]))
+
+
+def test_prepare_inputs_preserves_mlx_attention_mask_for_thread_handoff():
+    attention_mask = mx.array([[1, 1]], dtype=mx.int32)
+
+    class Processor:
+        tokenizer = SimpleNamespace(pad_token="[PAD]", eos_token="[EOS]")
+
+        def __call__(self, text=None, images=None, padding=None, return_tensors="mlx"):
+            return {
+                "input_ids": mx.array([[1, 2]], dtype=mx.int32),
+                "attention_mask": attention_mask,
+                "pixel_values": mx.zeros((1, 2), dtype=mx.float32),
+            }
+
+    inputs = prepare_inputs(
+        Processor(),
+        prompts="test <image>",
+        images=mx.zeros((3, 8, 8)),
+    )
+    consumed = []
+
+    def consume_attention_mask():
+        consumed.append(inputs["attention_mask"].tolist())
+
+    worker = Thread(target=consume_attention_mask)
+    worker.start()
+    worker.join(timeout=1)
+
+    assert inputs["attention_mask"] is attention_mask
+    assert consumed == [[[1, 1]]]
 
 
 def test_process_inputs_with_fallback():
@@ -368,6 +523,31 @@ def test_stopping_criteria_reset():
     assert stopping_criteria(7) is True
 
 
+def test_load_processor_preserves_additional_eos_tokens_on_reset():
+    processor = SimpleNamespace(
+        tokenizer=SimpleNamespace(eos_token_ids=[2]),
+        additional_eos_token_ids=[3],
+    )
+
+    class Detokenizer:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    with (
+        patch(
+            "mlx_vlm.utils.AutoProcessor.from_pretrained",
+            return_value=processor,
+        ),
+        patch("mlx_vlm.utils.load_tokenizer", return_value=Detokenizer),
+    ):
+        loaded = load_processor("unused-model-path")
+
+    criteria = loaded.tokenizer.stopping_criteria
+    assert criteria.eos_token_ids == [2, 3]
+    criteria.reset([5])
+    assert criteria.eos_token_ids == [5, 3]
+
+
 def test_load_passes_revision():
     model_mock = MagicMock()
     model_mock.config = MagicMock(eos_token_id=None)
@@ -375,8 +555,15 @@ def test_load_passes_revision():
 
     with (
         patch("mlx_vlm.utils.get_model_path") as mock_get_model_path,
-        patch("mlx_vlm.utils.load_model", return_value=model_mock),
-        patch("mlx_vlm.utils.load_processor", return_value=processor_mock),
+        patch(
+            "mlx_vlm.utils.load_model",
+            return_value=model_mock,
+        ),
+        patch(
+            "mlx_vlm.utils.load_processor",
+            return_value=processor_mock,
+        ),
+
         patch("mlx_vlm.utils.load_image_processor", return_value=None),
     ):
         mock_get_model_path.return_value = Path("/tmp/model")
@@ -390,47 +577,302 @@ def test_load_passes_revision():
         )
 
 
-def test_get_model_and_args_routes_text_only_configs():
-    model_class, model_type = get_model_and_args({"model_type": "llama"})
-
-    assert model_class.__name__ == "mlx_vlm.models.text_only"
-    assert model_type == "text_only"
+def test_get_model_and_args_rejects_unknown_text_configs():
+    with pytest.raises(ValueError):
+        get_model_and_args({"model_type": "unknown_text_arch"})
 
 
-def test_get_model_and_args_does_not_route_vision_configs_to_text_only():
+def test_get_model_and_args_remaps_mistral_to_llama():
+    model_class, model_type = get_model_and_args({"model_type": "mistral"})
+
+    assert model_class.__name__ == "mlx_vlm.models.llama"
+    assert model_type == "llama"
+
+
+@pytest.mark.parametrize(
+    ("alias", "native_model_type"),
+    [
+        ("phi-msft", "phixtral"),
+        ("falcon_mamba", "mamba"),
+        ("joyai_llm_flash", "deepseek_v3"),
+        ("kimi_k2", "deepseek_v3"),
+        ("minimax_m2", "minimax"),
+        ("iquestcoder", "llama"),
+    ],
+)
+def test_get_model_and_args_remaps_text_model_aliases(alias, native_model_type):
+    model_class, model_type = get_model_and_args({"model_type": alias})
+
+    assert model_class.__name__ == f"mlx_vlm.models.{native_model_type}"
+    assert model_type == native_model_type
+
+
+def test_get_model_and_args_rejects_unknown_vision_configs():
     with pytest.raises(ValueError):
         get_model_and_args(
             {"model_type": "unknown-vlm", "vision_config": {"hidden_size": 16}},
         )
 
 
-def test_load_model_routes_text_models_through_existing_loader():
-    safe_open = MagicMock()
-    safe_open.__enter__.return_value.metadata.return_value = {"format": "mlx"}
-
-    class FakeArgs:
+def test_load_model_forwards_strict_to_load_weights():
+    class FakeConfig:
         @classmethod
         def from_dict(cls, config):
             return cls()
 
-    class FakeLM(nn.Module):
-        def __init__(self, args):
+    class FakeModel(nn.Module):
+        def __init__(self, config):
             super().__init__()
-            self.model = nn.Linear(2, 2, bias=False)
+            self.config = config
 
-        def __call__(self, inputs, cache=None):
-            return self.model(inputs)
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {"weight": mx.zeros((1,), dtype=mx.float16)}
 
     with (
-        patch("mlx_vlm.utils.load_config", return_value={"model_type": "llama"}),
+        patch("mlx_vlm.utils.load_config", return_value={"model_type": "fake"}),
         patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
-        patch("mlx_vlm.utils.mx.load", return_value={"model.weight": mx.zeros((2, 2))}),
-        patch("mlx_vlm.utils.safetensors.safe_open", return_value=safe_open),
-        patch("mlx_lm.utils._get_classes", return_value=(FakeLM, FakeArgs)),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "fake"),
+        ),
     ):
         model = load_model(Path("/tmp/model"), lazy=True, strict=False)
 
-    assert getattr(model, "_is_text_model", False) is True
+    assert model.loaded_weights == list(weights.items())
+    assert model.loaded_strict is False
+
+
+class TestDropModulesWithoutWeights:
+    class ParameterlessHelper(nn.Module):
+        pass
+
+    class FakeModel(nn.Module):
+        def __init__(self, config=None):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+            self.vision_tower = nn.Linear(2, 2, bias=True)
+            self.parameterless_helper = (
+                TestDropModulesWithoutWeights.ParameterlessHelper()
+            )
+
+    def test_preserves_language_and_parameterless_modules(self, caplog):
+        model = self.FakeModel()
+        language_model = model.language_model
+        parameterless_helper = model.parameterless_helper
+
+        with caplog.at_level(logging.WARNING):
+            _drop_modules_without_weights(model, {})
+
+        assert model.language_model is language_model
+        assert model.parameterless_helper is parameterless_helper
+        assert model.vision_tower is None
+        assert "vision_tower" in caplog.text
+        assert "language_model" not in caplog.text
+        assert "parameterless_helper" not in caplog.text
+
+    def test_keeps_partially_weighted_module_for_strict_validation(self):
+        model = self.FakeModel()
+        weights = {
+            "language_model.weight": mx.zeros((2, 2)),
+            "vision_tower.bias": mx.zeros((2,)),
+        }
+
+        _drop_modules_without_weights(model, weights)
+
+        assert model.vision_tower is not None
+        with pytest.raises(ValueError, match="Missing"):
+            model.load_weights(list(weights.items()), strict=True)
+
+    def test_load_model_prunes_and_logs_text_only_modules(self, caplog):
+        class FakeConfig:
+            @classmethod
+            def from_dict(cls, config):
+                return cls()
+
+        class FakeModel(self.FakeModel):
+            def load_weights(self, weights, strict=True):
+                self.loaded_weights = weights
+                self.loaded_strict = strict
+
+        fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+        weights = {"language_model.weight": mx.zeros((2, 2))}
+
+        with (
+            patch(
+                "mlx_vlm.utils.load_config",
+                return_value={"model_type": "fake"},
+            ),
+            patch(
+                "mlx_vlm.utils.glob.glob",
+                return_value=["/tmp/model/model.safetensors"],
+            ),
+            patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+            patch(
+                "mlx_vlm.utils.get_model_and_args",
+                return_value=(fake_model_class, "fake"),
+            ),
+            caplog.at_level(logging.WARNING),
+        ):
+            model = load_model(Path("/tmp/model"), lazy=True)
+
+        assert model.language_model is not None
+        assert model.vision_tower is None
+        assert model.parameterless_helper is not None
+        assert "vision_tower" in caplog.text
+        assert model.loaded_strict is True
+
+
+def test_load_safetensors_reinterprets_f8_e8m0_header(tmp_path):
+    path = tmp_path / "model.safetensors"
+    header = {
+        "weight": {
+            "dtype": "F8_E8M0",
+            "shape": [1],
+            "data_offsets": [0, 1],
+        }
+    }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(struct.pack("<Q", len(header_bytes)) + header_bytes + b"\x00")
+
+    loaded = {"weight": mx.array([1], dtype=mx.uint8)}
+
+    def fake_mx_load(file_path):
+        current = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+        if current["weight"]["dtype"] == "F8_E8M0":
+            raise RuntimeError("unsupported dtype F8_E8M0")
+        assert current["weight"]["dtype"] == "U8"
+        return loaded
+
+    with patch("mlx_vlm.utils.mx.load", side_effect=fake_mx_load):
+        assert _load_safetensors(str(path)) is loaded
+
+    restored = json.loads(path.read_bytes()[8 : 8 + len(header_bytes)])
+    assert restored["weight"]["dtype"] == "F8_E8M0"
+
+
+def test_load_model_uses_deepseek_v4_fp8_quantization_config():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeDeepseekV4Model(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.language_model = nn.Linear(2, 2, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(
+        ModelConfig=FakeConfig, Model=FakeDeepseekV4Model
+    )
+    quantization = {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine",
+        "language_model.weight": {"group_size": 64, "bits": 8, "mode": "affine"},
+    }
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "deepseek_v4",
+                "quantization_config": {"quant_method": "fp8"},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value={}),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "deepseek_v4"),
+        ),
+        patch(
+            "mlx_vlm.models.deepseek_v4.language.make_quantization_config",
+            return_value=quantization,
+        ) as make_quantization_config,
+        patch("mlx_vlm.utils.nn.quantize") as quantize,
+    ):
+        model = load_model(Path("/tmp/model"), lazy=True)
+
+    make_quantization_config.assert_called_once_with(model)
+    quantize.assert_called_once()
+    assert quantize.call_args.kwargs["group_size"] == 64
+    assert quantize.call_args.kwargs["bits"] == 8
+    assert quantize.call_args.kwargs["mode"] == "affine"
+
+
+def test_load_model_quantizes_projector_with_scales_when_skip_vision():
+    class FakeConfig:
+        @classmethod
+        def from_dict(cls, config):
+            return cls()
+
+    class FakeProjector(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear_1 = nn.Linear(64, 64, bias=False)
+
+    class FakeModel(nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.config = config
+            self.vision_tower = nn.Linear(64, 64, bias=False)
+            self.multi_modal_projector = FakeProjector()
+            self.language_model = nn.Linear(64, 64, bias=False)
+
+        def load_weights(self, weights, strict=True):
+            self.loaded_weights = weights
+            self.loaded_strict = strict
+
+    fake_model_class = SimpleNamespace(ModelConfig=FakeConfig, Model=FakeModel)
+    weights = {
+        "language_model.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "language_model.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "multi_modal_projector.linear_1.weight": mx.zeros((64, 16), dtype=mx.uint32),
+        "multi_modal_projector.linear_1.scales": mx.zeros((64, 1), dtype=mx.float16),
+        "vision_tower.weight": mx.zeros((64, 64), dtype=mx.float16),
+    }
+    selected = {}
+
+    def fake_quantize(model, *args, **kwargs):
+        predicate = kwargs["class_predicate"]
+        selected["language"] = predicate("language_model", model.language_model)
+        selected["projector"] = predicate(
+            "multi_modal_projector.linear_1",
+            model.multi_modal_projector.linear_1,
+        )
+        selected["vision"] = predicate("vision_tower", model.vision_tower)
+
+    with (
+        patch(
+            "mlx_vlm.utils.load_config",
+            return_value={
+                "model_type": "kimi_vl",
+                "quantization": {"group_size": 64, "bits": 8},
+                "vision_config": {"skip_vision": True},
+            },
+        ),
+        patch("mlx_vlm.utils.glob.glob", return_value=["/tmp/model/model.safetensors"]),
+        patch("mlx_vlm.utils._load_safetensors", return_value=weights),
+        patch(
+            "mlx_vlm.utils.get_model_and_args",
+            return_value=(fake_model_class, "kimi_vl"),
+        ),
+        patch("mlx_vlm.utils.nn.quantize", side_effect=fake_quantize),
+    ):
+        load_model(Path("/tmp/model"), lazy=True)
+
+    assert selected == {"language": True, "projector": True, "vision": False}
 
 
 def test_load_delegates_adapter_loading_to_trainer_entrypoint():
@@ -459,65 +901,6 @@ def test_load_processor_propagates_auto_processor_errors():
             load_processor(Path("/tmp/model"), eos_token_ids=2)
 
 
-def test_text_only_model_provides_input_embeddings_and_wraps_logits():
-    class TinyInner(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(8, 3)
-            self.layers = []
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            if input_embeddings is not None:
-                return input_embeddings
-            return self.embed_tokens(inputs)
-
-    class TinyLM(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = TinyInner()
-            self.lm_head = nn.Linear(3, 4, bias=False)
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            return self.lm_head(self.model(inputs, cache, input_embeddings))
-
-    model = TextOnlyModel(TinyLM(), {"model_type": "llama", "eos_token_id": 2})
-    embeds = model.get_input_embeddings(mx.array([[1, 2]]))
-    output = model(mx.array([[1, 2]]), inputs_embeds=embeds.inputs_embeds)
-
-    assert embeds.inputs_embeds.shape == (1, 2, 3)
-    assert output.logits.shape == (1, 2, 4)
-    assert model.config.model_type == "llama"
-
-
-def test_text_only_language_model_uses_inner_embedding_path_when_outer_cannot():
-    class TinyInner(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed_tokens = nn.Embedding(8, 3)
-            self.layers = []
-
-        def __call__(self, inputs, cache=None, input_embeddings=None):
-            assert input_embeddings is not None
-            return input_embeddings
-
-    class OuterNoEmbeddingForward(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.model = TinyInner()
-            self.lm_head = nn.Linear(3, 4, bias=False)
-
-        def __call__(self, inputs, cache=None):
-            raise AssertionError("outer call should be bypassed for input embeddings")
-
-    model = TextOnlyModel(
-        OuterNoEmbeddingForward(), {"model_type": "gpt_oss", "eos_token_id": 2}
-    )
-    embeds = model.get_input_embeddings(mx.array([[1, 2]])).inputs_embeds
-    output = model.language_model(mx.array([[1, 2]]), inputs_embeds=embeds)
-
-    assert output.logits.shape == (1, 2, 4)
-
-
 def _make_test_image_bytes():
     """Create a small valid PNG in memory."""
     from PIL import Image as PILImage
@@ -530,6 +913,14 @@ def _make_test_image_bytes():
 
 
 class TestLoadImage:
+    def test_pil_image_input(self):
+        from PIL import Image as PILImage
+
+        source = PILImage.new("RGBA", (4, 4), color="red")
+        img = load_image(source)
+        assert img.mode == "RGB"
+        assert img.size == (4, 4)
+
     def test_bytesio_input(self):
         buf = _make_test_image_bytes()
         img = load_image(buf)
