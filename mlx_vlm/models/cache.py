@@ -6,7 +6,6 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Ordinary cache identities and raw-state decoding belong to MLX-LM.
 from mlx_lm.models.cache import (
-    _BaseCache,
     ArraysCache,
     BatchKVCache,
     BatchRotatingKVCache,
@@ -16,6 +15,7 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    _BaseCache,
     register_cache_type,
 )
 

@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
-
 from mlx_lm.models import cache as lm
+
 from mlx_vlm.models import cache as vlm
 
 
@@ -280,9 +280,10 @@ def test_quantized_apc_and_batch_extraction_return_canonical_owner(bits):
     assert row.offset == 2
     dk, dv = row.dequantize_for_apc()
     assert dk.shape == dv.shape == (1, 1, 2, 32)
-    assert mx.allclose(dk, mx.full(dk.shape, 2.0)).item() and mx.allclose(
-        dv, mx.full(dv.shape, 7.0)
-    ).item()
+    assert (
+        mx.allclose(dk, mx.full(dk.shape, 2.0)).item()
+        and mx.allclose(dv, mx.full(dv.shape, 7.0)).item()
+    )
     bk, bv = batch.dequantize_for_apc()
     assert mx.array_equal(dk, bk).item() and mx.array_equal(dv, bv).item()
     assert vlm.QuantizedKVCache().dequantize_for_apc() == (None, None)
@@ -293,9 +294,10 @@ def test_quantized_apc_and_batch_extraction_return_canonical_owner(bits):
     quantized = converted.to_quantized(group_size=32, bits=bits)
     assert type(quantized) is lm.QuantizedKVCache
     qk, qv = quantized.dequantize_for_apc()
-    assert mx.allclose(qk, mx.full(qk.shape, 3.0)).item() and mx.allclose(
-        qv, mx.full(qv.shape, 9.0)
-    ).item()
+    assert (
+        mx.allclose(qk, mx.full(qk.shape, 3.0)).item()
+        and mx.allclose(qv, mx.full(qv.shape, 9.0)).item()
+    )
 
 
 def test_specialized_algorithms_keep_vlm_identity_and_public_helpers():
@@ -417,9 +419,7 @@ def test_registered_buffered_restore_keeps_rollback_and_append_history():
 
 def test_registered_batch_quantized_restore_can_filter_and_finalize():
     original = vlm.BatchQuantizedKVCache([0, 0], group_size=32, bits=4)
-    original.update_and_fetch(
-        mx.full((2, 1, 2, 32), 2.0), mx.full((2, 1, 2, 32), 7.0)
-    )
+    original.update_and_fetch(mx.full((2, 1, 2, 32), 2.0), mx.full((2, 1, 2, 32), 7.0))
     restored = vlm.CacheList.from_state(
         [original.state], (["BatchQuantizedKVCache"], [original.meta_state])
     )[0]
@@ -429,9 +429,10 @@ def test_registered_batch_quantized_restore_can_filter_and_finalize():
     row = restored.extract(0)
     assert type(row) is lm.QuantizedKVCache and row.offset == 2
     keys, values = row.dequantize_for_apc()
-    assert mx.allclose(keys, mx.full(keys.shape, 2.0)).item() and mx.allclose(
-        values, mx.full(values.shape, 7.0)
-    ).item()
+    assert (
+        mx.allclose(keys, mx.full(keys.shape, 2.0)).item()
+        and mx.allclose(values, mx.full(values.shape, 7.0)).item()
+    )
 
 
 def test_registered_batch_pooling_restore_can_resume_and_filter():
@@ -487,9 +488,7 @@ def test_registered_specializations_restore_empty_raw_state():
 
 def test_file_loader_uses_registered_vlm_decoder_and_canonical_nested_owners(tmp_path):
     buffered = _kv([4, 5], vlm.BufferedRotatingKVCache(8, buffer_size=2))
-    original = vlm.CacheList(
-        _kv([1, 2]), buffered, _kv([7], vlm.ConcatenateKVCache())
-    )
+    original = vlm.CacheList(_kv([1, 2]), buffered, _kv([7], vlm.ConcatenateKVCache()))
     path = str(tmp_path / "shared-cache.safetensors")
     lm.save_prompt_cache(path, [original], metadata={"purpose": "codec-contract"})
     restored, metadata = lm.load_prompt_cache(path, return_metadata=True)
