@@ -1,4 +1,5 @@
 mlx>=0.32.0
+mlx-lm @ git+https://github.com/LibraxisAI/mlx-lm-mirror.git@b5b2865007f864ef5a6378f88159c2bbb733ea43
 transformers>=5.14.0
 miniaudio>=1.59
 tqdm>=4.66.2
