@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPECTED_MLX_LM_REQUIREMENT = (
     "mlx-lm @ "
@@ -31,8 +30,7 @@ def _require_one_canonical_shared_lm(requirements):
     candidates = [
         requirement
         for requirement in requirements
-        if requirement.partition("@")[0].strip().lower().replace("_", "-")
-        == "mlx-lm"
+        if requirement.partition("@")[0].strip().lower().replace("_", "-") == "mlx-lm"
     ]
     if candidates != [EXPECTED_MLX_LM_REQUIREMENT]:
         raise AssertionError(
